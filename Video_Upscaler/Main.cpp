@@ -1,18 +1,12 @@
 #include <windows.h>
-
 #include <d3d11.h>
-
 #include <dxgi1_6.h>
-
 #include <d3dcompiler.h>
-
 #include <winrt/base.h>
-
 #include <winrt/Windows.Foundation.h>
-
 #include <winrt/Windows.Graphics.Capture.h>
-
 #include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
 
 // Globals
 HWND g_hWnd = nullptr;
@@ -21,11 +15,30 @@ ID3D11DeviceContext* g_context = nullptr;
 IDXGISwapChain* g_swapChain = nullptr;
 ID3D11RenderTargetView* g_rtv = nullptr;
 
+// WGC Globals
+winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool g_framePool{ nullptr };
+winrt::Windows::Graphics::Capture::GraphicsCaptureSession g_session{ nullptr };
+winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice g_winrtDevice{ nullptr };
+winrt::com_ptr<ID3D11Texture2D> g_lastCapturedTexture{ nullptr };  // To hold the latest frame
+
 // Forward declarations
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 bool CreateDeviceAndSwapChain();
 void RenderFrame();
 void Cleanup();
+// WGC Forwards
+winrt::Windows::Graphics::Capture::GraphicsCaptureItem CreateCaptureItemForWindow(HWND targetHwnd);
+bool InitializeWGC(HWND targetHwnd);
+void OnFrameArrived(const winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool& sender, const winrt::Windows::Foundation::IInspectable&);
+void StopWGC();
+// Helper to create a WinRT Direct3D device from a D3D11 device
+winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice CreateWinrtDevice(ID3D11Device* d3dDevice) {
+    winrt::com_ptr<IDXGIDevice> dxgiDevice;
+    d3dDevice->QueryInterface(__uuidof(IDXGIDevice), dxgiDevice.put_void());
+    winrt::com_ptr<IInspectable> inspectable;
+    winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.get(), inspectable.put()));
+    return inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+}
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Register window class
@@ -42,15 +55,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_hWnd = CreateWindow(L"VideoScalerWindow", L"Video Scaler Overlay",
         WS_POPUP, 0, 0, desktop.right, desktop.bottom,
         nullptr, nullptr, hInstance, nullptr);
-
     if (!g_hWnd) return -1;
 
     // Make topmost and show
     SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     ShowWindow(g_hWnd, SW_SHOW);
 
-    // Initialize D3D11
+    // Initialize D3D11 FIRST
     if (!CreateDeviceAndSwapChain()) {
+        Cleanup();
+        return -1;
+    }
+
+    // Now initialize WGC (after device creation)
+    // Test target: Replace with real HWND (e.g., FindWindow(nullptr, L"Untitled - Notepad") for Notepad)
+    HWND targetHwnd = FindWindow(nullptr, L"Untitled - Notepad");
+    if (!targetHwnd) {
+        OutputDebugString(L"Target window not found!\n");
+        Cleanup();
+        return -1;
+    }
+    if (!InitializeWGC(targetHwnd)) {
+        OutputDebugString(L"WGC init failed!\n");
         Cleanup();
         return -1;
     }
@@ -67,7 +93,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     return 0;
 }
 
-// Single implementation for WindowProc
+// WindowProc (unchanged)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_DESTROY:
@@ -81,7 +107,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
 }
 
-// Single implementation for CreateDeviceAndSwapChain
+// CreateDeviceAndSwapChain (unchanged)
 bool CreateDeviceAndSwapChain() {
     // Create DXGI factory
     IDXGIFactory1* factory = nullptr;
@@ -109,7 +135,6 @@ bool CreateDeviceAndSwapChain() {
     scDesc.SampleDesc.Count = 1;
     scDesc.Windowed = TRUE;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-
     hr = factory->CreateSwapChain(g_device, &scDesc, &g_swapChain);
     factory->Release();
     if (FAILED(hr)) return false;
@@ -127,20 +152,137 @@ bool CreateDeviceAndSwapChain() {
     vp.Width = (float)scDesc.BufferDesc.Width;
     vp.Height = (float)scDesc.BufferDesc.Height;
     g_context->RSSetViewports(1, &vp);
-
     return true;
 }
 
+// RenderFrame (corrected: single path, copy if texture available)
 void RenderFrame() {
-    float clearColor[4] = { 0.0f, 0.2f, 0.4f, 1.0f };  // Dark blue
-    g_context->ClearRenderTargetView(g_rtv, clearColor);
+    ID3D11Texture2D* backBuffer = nullptr;
+    g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+
+    if (g_lastCapturedTexture) {
+        g_context->CopyResource(backBuffer, g_lastCapturedTexture.get());
+    }
+    else {
+        float clearColor[4] = { 0.0f, 0.2f, 0.4f, 1.0f };  // Fallback to blue
+        g_context->ClearRenderTargetView(g_rtv, clearColor);
+    }
+
+    backBuffer->Release();
     g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
     g_swapChain->Present(1, 0);  // VSync
 }
 
+// Cleanup (call StopWGC first)
 void Cleanup() {
+    StopWGC();
     if (g_rtv) g_rtv->Release();
     if (g_swapChain) g_swapChain->Release();
     if (g_context) g_context->Release();
     if (g_device) g_device->Release();
+}
+
+winrt::Windows::Graphics::Capture::GraphicsCaptureItem CreateCaptureItemForWindow(HWND targetHwnd) {
+    auto interopFactory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{ nullptr };
+    HRESULT hr = interopFactory->CreateForWindow(targetHwnd, winrt::guid_of<winrt::Windows::Graphics::Capture::IGraphicsCaptureItem>(), winrt::put_abi(item));
+    if (FAILED(hr)) {
+        OutputDebugString(L"CreateForWindow failed! HRESULT: ");
+        wchar_t buf[32]; swprintf(buf, 32, L"0x%X\n", hr); OutputDebugString(buf);
+        return nullptr;
+    }
+    return item;
+}
+
+bool InitializeWGC(HWND targetHwnd) {
+    // Wrap D3D11 device for WinRT
+    g_winrtDevice = CreateWinrtDevice(g_device);
+
+    // Create item
+    auto item = CreateCaptureItemForWindow(targetHwnd);
+    if (!item) return false;
+
+    // Create free-threaded frame pool
+    auto size = item.Size();
+    g_framePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+        g_winrtDevice,
+        winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        2, size);
+
+    // Subscribe to frames with auto_revoke
+    g_framePool.FrameArrived(winrt::auto_revoke, &OnFrameArrived);
+
+    // Create and start session
+    g_session = g_framePool.CreateCaptureSession(item);
+    g_session.StartCapture();
+
+    // Pre-allocate staging texture for capture (match format/size)
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = size.Width;
+    desc.Height = size.Height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;  // Changed to DEFAULT for CopyResource compatibility
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = 0;
+    HRESULT hr = g_device->CreateTexture2D(&desc, nullptr, g_lastCapturedTexture.put());
+    if (FAILED(hr)) {
+        OutputDebugString(L"Failed to create staging texture!\n");
+        return false;
+    }
+
+    return true;
+}
+
+// Manual declaration for IDirect3DDxgiInterfaceAccess (UUID correct)
+struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")) IDirect3DDxgiInterfaceAccess : IUnknown {
+    virtual HRESULT __stdcall GetInterface(REFIID iid, void** p) = 0;
+};
+
+void OnFrameArrived(const winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool& sender, const winrt::Windows::Foundation::IInspectable&) {
+    auto frame = sender.TryGetNextFrame();
+    if (!frame) {
+        OutputDebugString(L"No frame received!\n");
+        return;
+    }
+    OutputDebugString(L"Frame arrived!\n");  // Log to confirm event fires
+
+    // Extract ID3D11Texture2D from surface
+    auto surface = frame.Surface();
+    winrt::com_ptr<IDirect3DDxgiInterfaceAccess> dxgiAccess = surface.as<IDirect3DDxgiInterfaceAccess>();
+    winrt::com_ptr<ID3D11Texture2D> capturedTexture;
+    HRESULT hr = dxgiAccess->GetInterface(__uuidof(ID3D11Texture2D), capturedTexture.put_void());
+    if (FAILED(hr)) {
+        OutputDebugString(L"GetInterface failed! HRESULT: ");
+        wchar_t buf[32]; swprintf(buf, 32, L"0x%X\n", hr); OutputDebugString(buf);
+        return;
+    }
+
+    // Copy to our texture
+    if (capturedTexture) {
+        g_context->CopyResource(g_lastCapturedTexture.get(), capturedTexture.get());
+    }
+
+    // Handle size change
+    auto contentSize = frame.ContentSize();
+    D3D11_TEXTURE2D_DESC currentDesc;
+    g_lastCapturedTexture->GetDesc(&currentDesc);
+    if (contentSize.Width != currentDesc.Width || contentSize.Height != currentDesc.Height) {
+        // Recreate pool and texture
+        sender.Recreate(g_winrtDevice, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, contentSize);
+        currentDesc.Width = contentSize.Width;
+        currentDesc.Height = contentSize.Height;
+        g_lastCapturedTexture = nullptr;
+        g_device->CreateTexture2D(&currentDesc, nullptr, g_lastCapturedTexture.put());
+        OutputDebugString(L"Recreated pool and texture for new size\n");
+    }
+}
+
+void StopWGC() {
+    if (g_session) g_session.Close();
+    if (g_framePool) g_framePool.Close();
+    g_winrtDevice = nullptr;
+    g_lastCapturedTexture = nullptr;
 }
