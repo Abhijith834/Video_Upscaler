@@ -129,10 +129,12 @@
     <ClInclude Include="Resource.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="Video_Upscaler.h" />
+    <ClInclude Include="WindowSelectionModule.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Video_Upscaler.cpp" />
+    <ClCompile Include="WindowSelectionModule.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Video_Upscaler.rc" />

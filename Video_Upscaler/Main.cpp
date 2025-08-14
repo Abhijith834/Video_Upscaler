@@ -7,9 +7,8 @@
 #include <winrt/Windows.Graphics.Capture.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
-#include <winrt/Windows.UI.h>
-#include <winrt/Windows.UI.Composition.h>
-#include <shobjidl.h>  // For IInitializeWithWindow
+#include "WindowSelectionModule.h"  // Include the new module
+#include <winrt/base.h>
 
 // Manual declaration for IDirect3DDxgiInterfaceAccess
 struct __declspec(uuid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")) IDirect3DDxgiInterfaceAccess : IUnknown {
@@ -35,7 +34,6 @@ bool CreateDeviceAndSwapChain();
 void RenderFrame();
 void Cleanup();
 // WGC Forwards
-winrt::Windows::Graphics::Capture::GraphicsCaptureItem SelectCaptureTarget();
 bool InitializeWGC(const winrt::Windows::Graphics::Capture::GraphicsCaptureItem& item);
 void OnFrameArrived(const winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool& sender, const winrt::Windows::Foundation::IInspectable&);
 void StopWGC();
@@ -75,8 +73,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return -1;
     }
 
-    // Select capture target using popup
-    auto item = SelectCaptureTarget();
+    // Select capture target using the separate module
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem item = SelectCaptureTarget(g_hWnd);
     if (!item) {
         OutputDebugString(L"Capture target selection failed or canceled.\n");
         Cleanup();
@@ -187,22 +185,6 @@ void Cleanup() {
     if (g_swapChain) g_swapChain->Release();
     if (g_context) g_context->Release();
     if (g_device) g_device->Release();
-}
-
-// Function to show popup and select capture target
-winrt::Windows::Graphics::Capture::GraphicsCaptureItem SelectCaptureTarget() {
-    winrt::Windows::Graphics::Capture::GraphicsCapturePicker picker;
-    auto init = picker.as<IInitializeWithWindow>();
-    init->Initialize(g_hWnd);  // Parent to your window
-
-    auto item = picker.PickSingleItemAsync().get();  // Show popup and wait for selection
-    if (item) {
-        OutputDebugString(L"User selected a capture target.\n");
-    }
-    else {
-        OutputDebugString(L"Capture selection canceled.\n");
-    }
-    return item;
 }
 
 // Initialize WGC with selected item
